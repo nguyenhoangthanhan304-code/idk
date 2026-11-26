@@ -1,0 +1,1537 @@
+// BetterWidgets - desktop widgets: app launcher, clock, system card, github activity, anime tracker
+// Requires Qt 6.5+.  Build: cmake -B build -G Ninja && cmake --build build
+#include <QtWidgets>
+#include <QtNetwork>
+#include <functional>
+#include <memory>
+#ifdef Q_OS_WIN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
+// ---------------------------------------------------------------- config
+struct Cfg {
+    QColor accent = QColor("#ff6fa5"), accent2 = QColor("#4fe3c1");
+    int opacity = 82, radius = 18, refresh = 30, grid = 20, size = 100;   // size: widget scale in percent (100 = default), applied at launch
+    QString font, user, avatar;
+    bool locked = false, h24 = true, secs = true, mono = true, snap = true;
+    QMap<QString, int> wop;     // per-widget opacity override (0 / missing = use global)
+};
+Cfg& cfg() { static Cfg c; return c; }
+static const QStringList kIds{"launcher", "clock", "sysinfo", "github", "watching"};
+
+// bump this whenever the default widget positions change: saved positions are cleared once so the new layout applies
+static constexpr int kLayoutVersion = 7;
+
+static const char* g_argv0 = "";
+static int g_runSize = 100;          // widget size (percent) this process was started with
+static bool g_ownScale = false;      // true when this process set QT_SCALE_FACTOR itself
+
+// folder of the running exe (also works before QApplication exists)
+static QString exeDir() {
+#ifdef Q_OS_WIN
+    wchar_t buf[MAX_PATH * 4]; DWORD n = GetModuleFileNameW(nullptr, buf, DWORD(MAX_PATH * 4));
+    if (n) return QFileInfo(QString::fromWCharArray(buf, int(n))).absolutePath();
+#endif
+    if (QCoreApplication::instance()) return QCoreApplication::applicationDirPath();
+    return QFileInfo(QString::fromLocal8Bit(g_argv0)).absolutePath();
+}
+
+// the size is applied at launch, so a new size = start a fresh copy of the app and quit this one
+static void restartApp() {
+    static bool going = false; if (going) return; going = true;
+    QTimer::singleShot(250, [] {
+        if (g_ownScale) qunsetenv("QT_SCALE_FACTOR");      // let the new copy work out its own scale
+        QProcess::startDetached(QCoreApplication::applicationFilePath(), {});
+        QCoreApplication::quit();
+    });
+}
+
+// fonts: .ttf/.otf files in a "fonts" folder next to the exe (or in AppData if the exe folder is read-only) load automatically
+static QString fontsDir() {
+    QString d = exeDir() + "/fonts";
+    QDir().mkpath(d);
+    QFile t(d + "/.wd_write_test");
+    if (t.open(QIODevice::WriteOnly)) { t.close(); t.remove(); return d; }
+    d = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/fonts";
+    QDir().mkpath(d);
+    return d;
+}
+static void loadFonts() {
+    for (const auto& dir : {exeDir() + "/fonts", QDir::currentPath() + "/fonts",
+                            QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/fonts"})
+        for (const auto& f : QDir(dir).entryList({"*.ttf", "*.otf"}, QDir::Files)) QFontDatabase::addApplicationFont(dir + "/" + f);
+}
+static QString preferredFont() {
+    const QStringList have = QFontDatabase::families();
+    for (auto f : {"Quicksand", "Nunito", "Comfortaa", "Varela Round", "Lexend", "Segoe UI Variable Display"})
+        if (have.contains(f)) return f;
+    return QApplication::font().family();
+}
+
+// ---- settings file: betterwidgets.ini next to the exe (hot-reloaded when you save it)
+static QString cfgPath() {
+    static QString p = [] {
+        QString dir = exeDir();
+        QFile t(dir + "/.wd_write_test");
+        if (t.open(QIODevice::WriteOnly)) { t.close(); t.remove(); }
+        else { dir = QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation); QDir().mkpath(dir); }
+        return dir + "/betterwidgets.ini";
+    }();
+    return p;
+}
+static QString cfgText() {
+    auto& c = cfg(); QString s;
+    auto B = [](bool b) { return QString(b ? "true" : "false"); };
+    auto put = [&](const QString& key, const QString& val, const QString& note) { s += "# " + note + "\n" + key + " = " + val + "\n\n"; };
+    s += "# BetterWidgets settings\n# Edit this file and save it - the widgets update instantly, no restart needed.\n"
+         "# Lines starting with # are comments. Delete a line to get its default back.\n\n";
+    s += "# ================= look =================\n\n";
+    put("accent", c.accent.name(), "highlight color (pink pill, badge)");
+    put("accent2", c.accent2.name(), "second color (icons, graphs, buttons)");
+    put("opacity", QString::number(c.opacity), "background opacity of ALL widgets, 20-100");
+    put("radius", QString::number(c.radius), "corner radius, 0-40");
+    put("size", QString::number(c.size), "widget size in percent, 50-200 (100 = default). the app restarts itself to apply a change");
+    put("font", c.font, "font family name (empty = auto: Quicksand if installed)");
+    put("mono", B(c.mono), "flat one-color app icons in the launcher");
+    s += "# ================= layout =================\n\n";
+    put("locked", B(c.locked), "true = widgets cannot be dragged");
+    put("snap", B(c.snap), "snap widgets to a grid while dragging (hold ALT while dragging to ignore it)");
+    put("grid", QString::number(c.grid), "grid size in pixels, 5-200");
+    s += "# ================= clock / github =================\n\n";
+    put("h24", B(c.h24), "24-hour clock");
+    put("secs", B(c.secs), "show seconds");
+    put("github_user", c.user, "your github username");
+    put("github_refresh", QString::number(c.refresh), "github refresh interval in minutes, 5-600");
+    put("avatar", c.avatar, "profile picture path (you can also click the picture in the widget)");
+    s += "# ================= per-widget opacity =================\n"
+         "# 0 or empty = use the global opacity above. Widgets: launcher, clock, sysinfo, github, watching\n\n";
+    for (auto& id : kIds) s += "opacity." + id + " = " + QString::number(c.wop.value(id, 0)) + "\n";
+    s += "\n";
+    return s;
+}
+static void saveCfg() {
+    QFile f(cfgPath());
+    if (f.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) f.write(cfgText().toUtf8());
+}
+static QMap<QString, QString> readKv(const QString& path) {
+    QMap<QString, QString> m; QFile f(path);
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) return m;
+    for (auto line : QString::fromUtf8(f.readAll()).split('\n')) {
+        line = line.trimmed();
+        if (line.isEmpty() || line.startsWith('#') || line.startsWith(';')) continue;
+        int i = line.indexOf('='); if (i < 1) continue;
+        m[line.left(i).trimmed().toLower()] = line.mid(i + 1).trimmed();
+    }
+    return m;
+}
+static void loadCfgFile() {
+    auto kv = readKv(cfgPath()); auto& c = cfg(); Cfg d;
+    auto S = [&](const QString& k) { return kv.value(k); };
+    auto I = [&](const QString& k, int def, int lo, int hi) { bool ok = false; int v = kv.value(k).toInt(&ok); return ok ? qBound(lo, v, hi) : def; };
+    auto Bo = [&](const QString& k, bool def) {
+        if (!kv.contains(k)) return def; QString v = kv[k].toLower();
+        return v == "true" || v == "1" || v == "yes" || v == "on";
+    };
+    auto C = [&](const QString& k, const QColor& def) { QColor q(kv.value(k)); return q.isValid() ? q : def; };
+    c.accent = C("accent", d.accent); c.accent2 = C("accent2", d.accent2);
+    c.opacity = I("opacity", d.opacity, 20, 100); c.radius = I("radius", d.radius, 0, 40); c.size = I("size", d.size, 50, 200);
+    QString f = S("font"); c.font = (f.isEmpty() || !QFontDatabase::families().contains(f)) ? preferredFont() : f;
+    c.mono = Bo("mono", true); c.locked = Bo("locked", false); c.snap = Bo("snap", true); c.grid = I("grid", d.grid, 5, 200);
+    c.h24 = Bo("h24", true); c.secs = Bo("secs", true);
+    c.user = S("github_user"); c.refresh = I("github_refresh", 30, 5, 600); c.avatar = S("avatar");
+    c.wop.clear();
+    for (auto& id : kIds) { int v = kv.value("opacity." + id).toInt(); if (v > 0) c.wop[id] = qBound(5, v, 100); }
+}
+// first run: pick up whatever the old version stored in the registry, then write the file
+static void loadRegistryCfg() {
+    QSettings s; auto& c = cfg();
+    c.accent  = QColor(s.value("accent", "#ff6fa5").toString());
+    c.accent2 = QColor(s.value("accent2", "#4fe3c1").toString());
+    c.opacity = s.value("opacity", 82).toInt();
+    c.radius  = s.value("radius", 18).toInt();
+    QString sf = s.value("font").toString();
+    c.font    = (sf.isEmpty() || sf == QApplication::font().family()) ? preferredFont() : sf;
+    c.locked  = s.value("locked", false).toBool();
+    c.h24     = s.value("h24", true).toBool();
+    c.secs    = s.value("secs", true).toBool();
+    c.mono    = s.value("mono", true).toBool();
+    c.user    = s.value("ghUser", "").toString();
+    c.refresh = s.value("ghRefresh", 30).toInt();
+    c.avatar  = s.value("avatar", "").toString();
+}
+static void initCfg() {
+    if (QFile::exists(cfgPath())) loadCfgFile();
+    else { loadRegistryCfg(); saveCfg(); }
+}
+
+// renamed from "widgetdeck": carry the old settings file and the saved state (positions, launcher list, shows) over once
+static void migrateOldIni() {
+    if (QFile::exists(cfgPath())) return;
+    QString old = QFileInfo(cfgPath()).absolutePath() + "/widgetdeck.ini";
+    if (QFile::exists(old)) QFile::copy(old, cfgPath());
+}
+static void migrateOldSettings() {
+    QSettings now;
+    if (now.value("migrated").toBool()) return;
+    QSettings old("widgetdeck", "widgetdeck");
+    if (now.allKeys().isEmpty()) for (auto& k : old.allKeys()) now.setValue(k, old.value(k));
+    now.setValue("migrated", true);
+}
+// the widget size has to be known before QApplication is created, so it is read straight from the settings file
+static int earlySize() {
+    bool ok = false; int v = readKv(cfgPath()).value("size").toInt(&ok);
+    return ok ? qBound(50, v, 200) : 100;
+}
+
+class Bus : public QObject {
+    Q_OBJECT
+signals: void changed();
+};
+Bus& bus() { static Bus b; return b; }
+void openSettings();
+
+// ---------------------------------------------------------------- helpers
+[[maybe_unused]] static QString sh(const QString& p, const QStringList& a) {
+    QProcess x; x.start(p, a); x.waitForFinished(1500);
+    return QString::fromUtf8(x.readAllStandardOutput()).trimmed();
+}
+[[maybe_unused]] static double ramGB() {
+#ifdef Q_OS_MAC
+    return sh("sysctl", {"-n", "hw.memsize"}).toDouble() / 1073741824.0;
+#elif defined(Q_OS_LINUX)
+    QFile f("/proc/meminfo");
+    if (f.open(QIODevice::ReadOnly))
+        for (auto& t : f.readLine().split(' ')) { bool ok; double k = t.toDouble(&ok); if (ok) return k / 1048576.0; }
+    return 0;
+#elif defined(Q_OS_WIN)
+    MEMORYSTATUSEX m; m.dwLength = sizeof(m);
+    return GlobalMemoryStatusEx(&m) ? m.ullTotalPhys / 1073741824.0 : 0;
+#else
+    return 0;
+#endif
+}
+
+// square image with rounded corners, cropped from the top (good for posters / avatars)
+static QPixmap roundedSq(const QPixmap& src, int sz, int r) {
+    qreal dpr = qApp->devicePixelRatio(); int S = int(sz * dpr);
+    QPixmap out(S, S); out.fill(Qt::transparent); out.setDevicePixelRatio(dpr);
+    QPainter p(&out); p.setRenderHint(QPainter::Antialiasing); p.setRenderHint(QPainter::SmoothPixmapTransform);
+    QPainterPath path; path.addRoundedRect(0, 0, sz, sz, r, r); p.setClipPath(path);
+    QPixmap s = src.scaled(S, S, Qt::KeepAspectRatioByExpanding, Qt::SmoothTransformation);
+    p.drawPixmap(QRect(0, 0, sz, sz), s, QRect((s.width() - S) / 2, 0, S, S));
+    return out;
+}
+// placeholder tile: first letter on an accent gradient
+static QPixmap letterTile(const QString& s, int sz, int r) {
+    qreal dpr = qApp->devicePixelRatio();
+    QPixmap out(int(sz * dpr), int(sz * dpr)); out.setDevicePixelRatio(dpr); out.fill(Qt::transparent);
+    QPainter p(&out); p.setRenderHint(QPainter::Antialiasing);
+    QLinearGradient g(0, 0, sz, sz); g.setColorAt(0, cfg().accent); g.setColorAt(1, cfg().accent2);
+    p.setBrush(g); p.setPen(Qt::NoPen); p.drawRoundedRect(0, 0, sz, sz, r, r);
+    QFont f = p.font(); f.setPixelSize(sz / 2); f.setBold(true); p.setFont(f); p.setPen(QColor("#12302e"));
+    p.drawText(QRect(0, 0, sz, sz), Qt::AlignCenter, s.left(1).toUpper());
+    return out;
+}
+static QIcon magnifier() {
+    QPixmap p(32, 32); p.fill(Qt::transparent);
+    QPainter g(&p); g.setRenderHint(QPainter::Antialiasing);
+    g.setPen(QPen(QColor("#555"), 2.4, Qt::SolidLine, Qt::RoundCap));
+    g.drawEllipse(QPointF(14, 14), 7, 7); g.drawLine(QPointF(19, 19), QPointF(25, 25));
+    return QIcon(p);
+}
+// tiny "+" / "<" glyph icons for the launcher's "add app" and "back" rows
+static QIcon symbolIcon(const QString& ch, int sz = 22) {
+    qreal dpr = qApp->devicePixelRatio(); int S = int(sz * dpr);
+    auto mk = [&](const QColor& col) {
+        QPixmap p(S, S); p.setDevicePixelRatio(dpr); p.fill(Qt::transparent);
+        QPainter g(&p); g.setRenderHint(QPainter::Antialiasing); g.setPen(QPen(col, 2.2, Qt::SolidLine, Qt::RoundCap));
+        if (ch == "+") { g.drawLine(QPointF(sz * .3, sz * .5), QPointF(sz * .7, sz * .5)); g.drawLine(QPointF(sz * .5, sz * .3), QPointF(sz * .5, sz * .7)); }
+        else { g.drawLine(QPointF(sz * .6, sz * .28), QPointF(sz * .38, sz * .5)); g.drawLine(QPointF(sz * .38, sz * .5), QPointF(sz * .6, sz * .72)); }
+        return p;
+    };
+    QIcon ic; ic.addPixmap(mk(cfg().accent2), QIcon::Normal); ic.addPixmap(mk(QColor("#1a1a1a")), QIcon::Selected); return ic;
+}
+
+// ---------------------------------------------------------------- installed applications
+struct App { QString name, target, icon, custom, orig; };   // target: .app / .lnk path, or Exec line on linux; custom: user-picked icon file
+
+static QStringList appRoots() {
+#ifdef Q_OS_MAC
+    return {"/Applications", "/System/Applications", "/System/Applications/Utilities", QDir::homePath() + "/Applications"};
+#elif defined(Q_OS_WIN)
+    return {qEnvironmentVariable("ProgramData") + "/Microsoft/Windows/Start Menu/Programs",
+            qEnvironmentVariable("APPDATA") + "/Microsoft/Windows/Start Menu/Programs"};
+#else
+    return {"/usr/share/applications", "/usr/local/share/applications", QDir::homePath() + "/.local/share/applications",
+            "/var/lib/flatpak/exports/share/applications", QDir::homePath() + "/.local/share/flatpak/exports/share/applications",
+            "/var/lib/snapd/desktop/applications"};
+#endif
+}
+
+// only installed applications - never documents or random files
+static QList<App> scanApps() {
+    QList<App> out; QSet<QString> seen;
+    auto add = [&](const QString& name, const QString& target, const QString& icon = {}) {
+        QString n = name.trimmed(), k = n.toLower();
+        if (n.isEmpty() || seen.contains(k)) return;
+        for (auto bad : {"uninstall", "readme", "release notes", "documentation", "license"}) if (k.contains(bad)) return;
+        seen.insert(k); out.push_back({n, target, icon});
+    };
+#ifdef Q_OS_MAC
+    std::function<void(const QString&, int)> walk = [&](const QString& dir, int depth) {
+        for (auto& fi : QDir(dir).entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name)) {
+            if (fi.suffix() == "app") add(fi.completeBaseName(), fi.absoluteFilePath());
+            else if (depth > 0) walk(fi.absoluteFilePath(), depth - 1);
+        }
+    };
+    for (auto& r : appRoots()) walk(r, 1);
+#elif defined(Q_OS_WIN)
+    for (auto& r : appRoots()) {
+        QDirIterator it(r, {"*.lnk"}, QDir::Files, QDirIterator::Subdirectories);
+        while (it.hasNext()) {
+            it.next(); QFileInfo t(it.fileInfo().symLinkTarget());
+            if (!t.filePath().isEmpty() && t.isDir()) continue;   // folder shortcuts are not apps
+            add(it.fileInfo().completeBaseName(), it.filePath());
+        }
+    }
+    // apps without a start-menu shortcut: look in the usual install folders (only added if not already found above)
+    const QList<QPair<QString, QString>> known = {
+        {"Visual Studio Code", qEnvironmentVariable("LOCALAPPDATA") + "/Programs/Microsoft VS Code/Code.exe"},
+        {"Visual Studio Code", qEnvironmentVariable("ProgramFiles") + "/Microsoft VS Code/Code.exe"},
+        {"Visual Studio Code", qEnvironmentVariable("ProgramFiles(x86)") + "/Microsoft VS Code/Code.exe"},
+    };
+    for (auto& k : known) if (QFileInfo::exists(k.second)) add(k.first, k.second);
+#else
+    static const QRegularExpression fieldCode("%[a-zA-Z]");
+    for (auto& r : appRoots()) {
+        QDirIterator it(r, {"*.desktop"}, QDir::Files, QDirIterator::Subdirectories);
+        while (it.hasNext()) {
+            QFile f(it.next()); if (!f.open(QIODevice::ReadOnly)) continue;
+            QString name, exec, icon; bool hide = false, isApp = true, inEntry = false;
+            for (auto line : QString::fromUtf8(f.readAll()).split('\n')) {
+                line = line.trimmed();
+                if (line.startsWith('[')) { inEntry = line == "[Desktop Entry]"; continue; }
+                if (!inEntry) continue;
+                if (line.startsWith("Name=") && name.isEmpty()) name = line.mid(5);
+                else if (line.startsWith("Exec=")) exec = line.mid(5).remove(fieldCode).trimmed();
+                else if (line.startsWith("Icon=")) icon = line.mid(5);
+                else if (line == "NoDisplay=true" || line == "Hidden=true") hide = true;
+                else if (line.startsWith("Type=")) isApp = line.mid(5) == "Application";
+            }
+            if (!hide && isApp && !exec.isEmpty()) add(name, exec, icon);
+        }
+    }
+#endif
+    std::sort(out.begin(), out.end(), [](const App& a, const App& b) { return a.name.toLower() < b.name.toLower(); });
+    return out;
+}
+
+static void launchApp(const App& a) {
+#ifdef Q_OS_MAC
+    QProcess::startDetached("open", {a.target});
+#elif defined(Q_OS_WIN)
+    if (a.target.startsWith("shell:")) QProcess::startDetached("explorer.exe", {a.target});   // microsoft store apps
+    else QDesktopServices::openUrl(QUrl::fromLocalFile(a.target));
+#else
+    auto args = QProcess::splitCommand(a.target);
+    if (!args.isEmpty()) { auto p = args.takeFirst(); QProcess::startDetached(p, args); }
+#endif
+}
+
+// Turns any app icon into a flat one-color glyph on a transparent background, with cut-out gaps.
+static QImage glyphMask(const QPixmap& src) {
+    QImage im = src.toImage().convertToFormat(QImage::Format_ARGB32);
+    const int W = im.width(), H = im.height();
+    QHash<int, int> hist; qint64 opaque = 0; double lumSum = 0;
+    for (int y = 0; y < H; ++y) for (int x = 0; x < W; ++x) {
+        QRgb c = im.pixel(x, y); if (qAlpha(c) < 128) continue;
+        ++opaque; lumSum += qGray(c);
+        ++hist[((qRed(c) >> 4) << 8) | ((qGreen(c) >> 4) << 4) | (qBlue(c) >> 4)];
+    }
+    QImage out(W, H, QImage::Format_ARGB32); out.fill(0);
+    if (!opaque) return out;
+    int best = 0, bestN = 0;
+    for (auto it = hist.begin(); it != hist.end(); ++it) if (it.value() > bestN) { bestN = it.value(); best = it.key(); }
+    double frac = double(bestN) / opaque, mean = lumSum / opaque;
+    int br = ((best >> 8) & 15) * 16 + 8, bg = ((best >> 4) & 15) * 16 + 8, bb = (best & 15) * 16 + 8;
+    auto smooth = [](double e0, double e1, double v) { double t = qBound(0.0, (v - e0) / (e1 - e0), 1.0); return t * t * (3 - 2 * t); };
+    for (int y = 0; y < H; ++y) {
+        auto* o = reinterpret_cast<QRgb*>(out.scanLine(y));
+        for (int x = 0; x < W; ++x) {
+            QRgb c = im.pixel(x, y); int a = qAlpha(c); if (!a) continue;
+            double k;
+            if (frac >= 0.3) {
+                double dr = qRed(c) - br, dg = qGreen(c) - bg, db = qBlue(c) - bb;
+                double d = std::sqrt(dr * dr + dg * dg + db * db) / 441.0, g = smooth(0.18, 0.38, d);
+                k = frac >= 0.5 ? 1.0 - g : g;
+            } else k = smooth(mean - 25, mean + 25, qGray(c));
+            o[x] = qRgba(255, 255, 255, int(a * k));
+        }
+    }
+    return out;
+}
+static QPixmap tintMask(const QImage& mask, const QColor& col, int px, qreal dpr) {
+    QImage t = mask.scaled(px, px, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+    QPainter p(&t); p.setCompositionMode(QPainter::CompositionMode_SourceIn); p.fillRect(t.rect(), col); p.end();
+    QPixmap out = QPixmap::fromImage(t); out.setDevicePixelRatio(dpr); return out;
+}
+// the app's own icon, or the one the user picked, as a flat one-color icon
+static QIcon appIcon(const App& a, int sz) {
+    QPixmap px;
+    if (!a.custom.isEmpty()) px = QPixmap(a.custom);
+    if (px.isNull()) {
+        QIcon ic;
+#ifdef Q_OS_LINUX
+        ic = QIcon::fromTheme(a.icon);
+        if (ic.isNull() && QFileInfo::exists(a.icon)) ic = QIcon(a.icon);
+#else
+        static QFileIconProvider prov;
+        QFileInfo fi(a.target);
+        QString real = fi.symLinkTarget();      // use the real exe's icon, not the shortcut-arrow icon of the .lnk
+        if (!a.target.startsWith("shell:")) ic = prov.icon((real.isEmpty() || !QFileInfo::exists(real)) ? fi : QFileInfo(real));
+#endif
+        if (!ic.isNull()) px = ic.pixmap(QSize(64, 64));
+    }
+    if (px.isNull()) return QIcon(letterTile(a.name, sz, 6));
+    if (!cfg().mono) return QIcon(px);
+    qreal dpr = qApp->devicePixelRatio(); int S = int(sz * dpr);
+    QImage m = glyphMask(px); QIcon out;
+    out.addPixmap(tintMask(m, cfg().accent2, S, dpr), QIcon::Normal);
+    out.addPixmap(tintMask(m, QColor("#1a1a1a"), S, dpr), QIcon::Selected);   // dark glyph on the pink pill
+    return out;
+}
+
+// ---------------------------------------------------------------- base glass widget
+class Glass;
+QList<Glass*> g_widgets;
+
+class Glass : public QWidget {
+public:
+    QString id; QPoint defPos; QPoint dragOff; bool dragging = false;
+    Glass(const QString& id_, QSize sz, QPoint dp) : id(id_), defPos(dp) {
+        setWindowFlags(Qt::FramelessWindowHint | Qt::Tool | Qt::WindowStaysOnBottomHint);
+        setAttribute(Qt::WA_TranslucentBackground);
+        setAttribute(Qt::WA_MacAlwaysShowToolWindow);
+        resize(sz);
+        move(QSettings().value("pos/" + id, defPos).toPoint());
+        QObject::connect(&bus(), &Bus::changed, this, [this] { restyle(); update(); });
+        g_widgets << this;
+    }
+    void resetPos() { QSettings().remove("pos/" + id); move(defPos); }
+    virtual QString css() { return {}; }
+    virtual void restyle() {
+        auto& c = cfg();
+        QString ss = (QString("QLabel,QLineEdit,QListWidget,QToolButton{color:#e6fff6;font-family:'%1';}"
+                               "QScrollBar:vertical{background:transparent;width:6px;margin:0;}"
+                               "QScrollBar::handle:vertical{background:rgba(255,255,255,60);border-radius:3px;min-height:24px;}"
+                               "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}"
+                               "QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical{background:transparent;}").arg(c.font) +
+                       css());
+        ss.replace("ACC2", c.accent2.name()).replace("ACC", c.accent.name());
+        setStyleSheet(ss);
+    }
+protected:
+    void paintEvent(QPaintEvent*) override {
+        QPainter p(this); p.setRenderHint(QPainter::Antialiasing);
+        int op = cfg().wop.value(id, 0); if (op <= 0) op = cfg().opacity;
+        p.setBrush(QColor(18, 48, 46, op * 255 / 100));
+        p.setPen(QColor(255, 255, 255, 25));
+        p.drawRoundedRect(rect().adjusted(1, 1, -1, -1), cfg().radius, cfg().radius);
+    }
+    void mousePressEvent(QMouseEvent* e) override {
+        if (e->button() == Qt::LeftButton && !cfg().locked) { dragging = true; dragOff = e->globalPosition().toPoint() - frameGeometry().topLeft(); }
+    }
+    void mouseMoveEvent(QMouseEvent* e) override {
+        if (!dragging) return;
+        QPoint t = e->globalPosition().toPoint() - dragOff;
+        if (cfg().snap && cfg().grid > 1 && !(e->modifiers() & Qt::AltModifier)) {      // snap to grid (hold ALT to ignore)
+            QScreen* sc = QGuiApplication::screenAt(e->globalPosition().toPoint());
+            if (!sc) sc = QGuiApplication::primaryScreen();
+            QPoint o = sc->availableGeometry().topLeft(); int g = cfg().grid;
+            t.setX(o.x() + qRound((t.x() - o.x()) / double(g)) * g);
+            t.setY(o.y() + qRound((t.y() - o.y()) / double(g)) * g);
+        }
+        move(t);
+    }
+    void mouseReleaseEvent(QMouseEvent*) override {
+        if (dragging) { dragging = false; QSettings().setValue("pos/" + id, pos()); }
+    }
+    void contextMenuEvent(QContextMenuEvent* e) override {
+        QMenu m;
+        m.addAction("settings...", [] { openSettings(); });
+        m.addAction(cfg().locked ? "unlock position" : "lock position", [] { cfg().locked = !cfg().locked; saveCfg(); emit bus().changed(); });
+        m.addAction("snap to grid: " + QString(cfg().snap ? "on" : "off"), [] { cfg().snap = !cfg().snap; saveCfg(); emit bus().changed(); });
+        m.addAction("reset position", [this] { resetPos(); });
+        m.addAction("hide", [this] { hide(); QSettings().setValue("visible/" + id, false); });
+        m.exec(e->globalPos());
+    }
+};
+
+// ---------------------------------------------------------------- search box with smooth typing animation
+//  - underline follows the width of what you type (animated), with a glowing dot at its tip
+//  - a soft accent ring pulses on every keystroke
+class SmoothEdit : public QLineEdit {
+    Q_OBJECT
+    qreal ul_ = 0, pulse_ = 0;
+    QVariantAnimation ua, pa;
+public:
+    SmoothEdit() {
+        ua.setDuration(260); ua.setEasingCurve(QEasingCurve::OutCubic);
+        connect(&ua, &QVariantAnimation::valueChanged, this, [this](const QVariant& v) { ul_ = v.toReal(); update(); });
+        pa.setDuration(420); pa.setEasingCurve(QEasingCurve::OutQuad); pa.setStartValue(1.0); pa.setEndValue(0.0);
+        connect(&pa, &QVariantAnimation::valueChanged, this, [this](const QVariant& v) { pulse_ = v.toReal(); update(); });
+        connect(this, &QLineEdit::textChanged, this, [this] { pa.stop(); pa.start(); retarget(); });
+    }
+    void retarget() {
+        qreal maxW = qMax(30, width() - 28);
+        qreal t = hasFocus() ? qBound<qreal>(30.0, fontMetrics().horizontalAdvance(text()) + 50.0, maxW) : 0.0;
+        ua.stop(); ua.setStartValue(ul_); ua.setEndValue(t); ua.start();
+    }
+protected:
+    void focusInEvent(QFocusEvent* e) override { QLineEdit::focusInEvent(e); retarget(); }
+    void focusOutEvent(QFocusEvent* e) override { QLineEdit::focusOutEvent(e); retarget(); }
+    void paintEvent(QPaintEvent* e) override {
+        QLineEdit::paintEvent(e);
+        QPainter p(this); p.setRenderHint(QPainter::Antialiasing);
+        if (ul_ > 0.5) {
+            QColor c = cfg().accent; c.setAlpha(int(200 + 55 * pulse_));
+            p.setPen(Qt::NoPen); p.setBrush(c);
+            p.drawRoundedRect(QRectF(14, height() - 5, ul_, 3), 1.5, 1.5);
+            QColor g = cfg().accent; g.setAlpha(int(90 + 140 * pulse_));
+            p.setBrush(g); p.drawEllipse(QPointF(14 + ul_, height() - 3.5), 2.5 + 2.5 * pulse_, 2.5 + 2.5 * pulse_);
+        }
+        if (pulse_ > 0.01) {
+            QColor g = cfg().accent; g.setAlpha(int(130 * pulse_));
+            p.setBrush(Qt::NoBrush); p.setPen(QPen(g, 2));
+            p.drawRoundedRect(QRectF(rect()).adjusted(1, 1, -1, -1), 12, 12);
+        }
+    }
+};
+
+// ---------------------------------------------------------------- list with a pink pill that glides to the hovered / selected row
+class PillList : public QListWidget {
+    Q_OBJECT
+    qreal py = 0, ph = 0; bool has = false; QVariantAnimation a;
+public:
+    PillList() {
+        setMouseTracking(true); viewport()->setMouseTracking(true);
+        a.setDuration(240); a.setEasingCurve(QEasingCurve::OutCubic);
+        connect(&a, &QVariantAnimation::valueChanged, this, [this](const QVariant& v) { py = v.toReal(); viewport()->update(); });
+    }
+    void syncPill(bool animate) {
+        auto it = currentItem(); if (!it) return;
+        QRect r = visualItemRect(it); if (r.isEmpty()) return;
+        qreal target = r.top() + verticalScrollBar()->value(); ph = r.height();
+        if (!has || !animate) { has = true; a.stop(); py = target; }
+        else if (qAbs(py - target) > 0.5) { a.stop(); a.setStartValue(py); a.setEndValue(target); a.start(); }
+        viewport()->update();
+    }
+protected:
+    void paintEvent(QPaintEvent* e) override {
+        if (has && currentItem()) {
+            QPainter p(viewport()); p.setRenderHint(QPainter::Antialiasing);
+            p.setPen(Qt::NoPen); p.setBrush(cfg().accent);
+            p.drawRoundedRect(QRectF(0, py - verticalScrollBar()->value(), viewport()->width(), ph), 12, 12);
+        }
+        QListWidget::paintEvent(e);
+    }
+    void mouseMoveEvent(QMouseEvent* e) override {
+        auto it = itemAt(e->position().toPoint());
+        if (it && it != currentItem() && (it->flags() & Qt::ItemIsEnabled)) setCurrentItem(it);
+        QListWidget::mouseMoveEvent(e);
+    }
+};
+
+// ---------------------------------------------------------------- launcher (your own list, max 11 apps)
+//  - hover an app: the pink pill glides to it.  DOUBLE-click (or Enter) opens it.  Single click only selects.
+//  - typing searches your list first, then EVERY installed app
+//  - "+ add app" opens a picker with every installed app; click one to add it
+//  - right-click an app: change icon / reset icon / remove from list
+class Launcher : public Glass {
+    Q_OBJECT
+    enum Kind { KApp = 0, KAdd = 1, KBack = 2, KAll = 3, KBrowse = 4 };
+    static constexpr int kMax = 11, kRow = 42;      // kMax = the most apps you can add to the launcher (11)
+    SmoothEdit* q; PillList* l;
+    QList<App> apps, lnkApps, storeApps, pins; bool adding = false;
+    QProcess* sp = nullptr;
+    QHash<QString, QIcon> cache;
+    QFileSystemWatcher fw; QTimer rescanT;
+    QVariantAnimation hA;
+    bool isAppKind(int k) const { return k == KApp || k == KAll; }
+public:
+    Launcher() : Glass("launcher", {280, 530}, {40, 40}) {
+        setFixedWidth(280);
+        auto v = new QVBoxLayout(this); v->setContentsMargins(12, 12, 12, 12); v->setSpacing(8);
+        q = new SmoothEdit; q->setPlaceholderText("Search..."); q->addAction(magnifier(), QLineEdit::LeadingPosition); q->installEventFilter(this);
+        l = new PillList; l->setFrameShape(QFrame::NoFrame); l->setFocusPolicy(Qt::NoFocus); l->setIconSize({26, 26});
+        l->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff); l->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+        l->setContextMenuPolicy(Qt::CustomContextMenu);
+        v->addWidget(q); v->addWidget(l);
+        connect(q, &QLineEdit::textChanged, this, [this] { fill(); });
+        connect(q, &QLineEdit::returnPressed, this, [this] { activate(l->currentItem()); });
+        // single click only selects; add/back rows and the app picker still react to one click
+        connect(l, &QListWidget::itemClicked, this, [this](QListWidgetItem* i) {
+            int k = i->data(Qt::UserRole + 1).toInt();
+            if (adding || k == KAdd || k == KBack) activate(i);
+        });
+        // launching an app needs a double click (or Enter in the search box)
+        connect(l, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem* i) {
+            if (!adding && isAppKind(i->data(Qt::UserRole + 1).toInt())) activate(i);
+        });
+        connect(l, &QListWidget::currentItemChanged, this, [this](QListWidgetItem* cur) {
+            for (int i = 0; i < l->count(); ++i) {       // add/back rows are dim, dark when under the pill
+                auto it = l->item(i);
+                if (!isAppKind(it->data(Qt::UserRole + 1).toInt())) it->setForeground(it == cur ? QColor("#1a1a1a") : QColor(255, 255, 255, 150));
+            }
+            l->syncPill(true);
+        });
+        connect(l, &QListWidget::customContextMenuRequested, this, [this](const QPoint& pos) { menuAt(pos); });
+        connect(&bus(), &Bus::changed, this, [this] { cache.clear(); fill(); });
+
+        // smooth list resize while typing
+        hA.setDuration(180); hA.setEasingCurve(QEasingCurve::OutCubic);
+        connect(&hA, &QVariantAnimation::valueChanged, this, [this](const QVariant& v) {
+            l->setFixedHeight(v.toInt()); layout()->activate(); adjustSize();
+        });
+
+        loadPins();
+        // pick up newly installed / removed apps automatically
+        for (auto& d : appRoots()) if (QDir(d).exists()) fw.addPath(d);
+        rescanT.setSingleShot(true); rescanT.setInterval(3000);
+        connect(&fw, &QFileSystemWatcher::directoryChanged, this, [this] { rescanT.start(); });
+        connect(&rescanT, &QTimer::timeout, this, [this] { rescan(); });
+        auto per = new QTimer(this); connect(per, &QTimer::timeout, this, [this] { rescan(); }); per->start(600000);
+        restyle(); rescan();
+    }
+
+    // ---- saved list
+    void loadPins() {
+        pins.clear();
+        for (auto v : QJsonDocument::fromJson(QSettings().value("pinned").toString().toUtf8()).array()) {
+            auto o = v.toObject(); pins.push_back({o["n"].toString(), o["t"].toString(), o["i"].toString(), o["c"].toString(), o["o"].toString()});
+        }
+        while (pins.size() > kMax) pins.removeLast();      // hard limit: 11 apps in the list
+    }
+    // user = true when the change came from the person (add / remove / icon); the auto-seed passes false
+    void savePins(bool user = true) {
+        QJsonArray a;
+        for (auto& p : pins) a.append(QJsonObject{{"n", p.name}, {"t", p.target}, {"i", p.icon}, {"c", p.custom}, {"o", p.orig}});
+        QSettings().setValue("pinned", QString::fromUtf8(QJsonDocument(a).toJson(QJsonDocument::Compact)));
+        if (user) QSettings().setValue("pinsEdited", true);
+    }
+    bool isPinned(const App& a) const { for (auto& p : pins) if (p.target == a.target) return true; return false; }
+    void seedPins() {   // only while the list is empty and you never edited it: pin whatever common apps are installed
+        const QStringList want{"visual studio code", "github", "postman", "spotify", "discord", "file explorer", "terminal",
+                               "powershell", "chrome", "firefox", "edge", "steam", "photoshop", "notepad"};
+        for (auto& w : want) {
+            if (pins.size() >= kMax) break;
+            for (auto& a : apps) if (a.name.contains(w, Qt::CaseInsensitive) && !isPinned(a)) { pins.push_back(a); break; }
+        }
+        if (!pins.isEmpty()) savePins(false);
+    }
+    void mergeApps() {
+        apps = lnkApps; QSet<QString> have;
+        for (auto& a : apps) have.insert(a.name.toLower());
+        for (auto& st : storeApps) {
+            QString k = st.name.toLower(); bool bad = have.contains(k);
+            for (auto b : {"uninstall", "readme", "release notes", "documentation", "license"}) if (k.contains(b)) bad = true;
+            if (!bad) { have.insert(k); apps.push_back(st); }
+        }
+        std::sort(apps.begin(), apps.end(), [](const App& a, const App& b) { return a.name.toLower() < b.name.toLower(); });
+        if (pins.isEmpty() && !QSettings().value("pinsEdited", false).toBool()) seedPins();
+        fill();
+    }
+    void rescan() {
+        lnkApps = scanApps();
+        mergeApps();
+#ifdef Q_OS_WIN
+        if (sp) return;
+        sp = new QProcess(this);
+        sp->setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments* a) { a->flags |= CREATE_NO_WINDOW; });
+        connect(sp, &QProcess::errorOccurred, this, [this] { if (sp) { sp->deleteLater(); sp = nullptr; } });
+        connect(sp, &QProcess::finished, this, [this] {
+            if (!sp) return;
+            auto doc = QJsonDocument::fromJson(sp->readAllStandardOutput());
+            QJsonArray arr = doc.isArray() ? doc.array() : QJsonArray{doc.object()};
+            storeApps.clear();
+            for (auto v : arr) {
+                auto o = v.toObject(); QString n = o["Name"].toString(), id = o["AppID"].toString();
+                if (!n.isEmpty() && !id.isEmpty()) storeApps.push_back({n, "shell:AppsFolder\\" + id, "", "", ""});
+            }
+            sp->deleteLater(); sp = nullptr;
+            mergeApps();
+        });
+        sp->start("powershell", {"-NoProfile", "-NonInteractive", "-Command",
+                                 "[Console]::OutputEncoding=[Text.Encoding]::UTF8; Get-StartApps | ConvertTo-Json -Compress"});
+#endif
+    }
+
+    // ---- list
+    QIcon iconFor(const App& a) {
+        QString key = a.target + "|" + a.custom;
+        if (!cache.contains(key)) cache[key] = appIcon(a, 26);
+        return cache[key];
+    }
+    void fit() {
+        int target = (adding ? kMax : qBound(1, int(l->count()), kMax)) * kRow + 4;
+        if (!isVisible()) { l->setFixedHeight(target); layout()->activate(); adjustSize(); return; }
+        hA.stop(); hA.setStartValue(l->height()); hA.setEndValue(target); hA.start();
+    }
+    void fill() {
+        l->clear(); QString f = q->text().trimmed();
+        auto item = [this](const QString& text, const QIcon& ic, int kind, int idx) {
+            auto it = new QListWidgetItem(ic, text);
+            it->setData(Qt::UserRole, idx); it->setData(Qt::UserRole + 1, kind); it->setSizeHint(QSize(0, kRow));
+            if (!isAppKind(kind)) it->setForeground(QColor(255, 255, 255, 150));
+            l->addItem(it);
+        };
+        if (adding) {
+            item("back", symbolIcon("<"), KBack, 0);
+            item("browse for app...", symbolIcon("+"), KBrowse, 0);
+            for (int i = 0; i < apps.size(); ++i) {
+                if (isPinned(apps[i]) || (!f.isEmpty() && !apps[i].name.contains(f, Qt::CaseInsensitive))) continue;
+                item(apps[i].name.toLower(), iconFor(apps[i]), KApp, i);
+            }
+        } else {
+            for (int i = 0; i < pins.size(); ++i)
+                if (f.isEmpty() || pins[i].name.contains(f, Qt::CaseInsensitive)) item(pins[i].name.toLower(), iconFor(pins[i]), KApp, i);
+            if (f.isEmpty() && pins.size() < kMax) item("add app", symbolIcon("+"), KAdd, 0);   // list full (11) -> no add row
+            if (!f.isEmpty()) {          // also search every installed app, not just your list
+                int n = 0;
+                for (int i = 0; i < apps.size() && n < 40; ++i)
+                    if (!isPinned(apps[i]) && apps[i].name.contains(f, Qt::CaseInsensitive)) { item(apps[i].name.toLower(), iconFor(apps[i]), KAll, i); ++n; }
+            }
+        }
+        l->setCurrentRow(adding && l->count() > 2 ? 2 : 0);
+        fit();
+    }
+    void setAdding(bool a) {
+        adding = a; q->clear();
+        q->setPlaceholderText(a ? "find an app to add..." : "Search...");
+        fill(); q->setFocus();
+    }
+    void activate(QListWidgetItem* it) {
+        if (!it) return;
+        int idx = it->data(Qt::UserRole).toInt(), kind = it->data(Qt::UserRole + 1).toInt();
+        if (kind == KAdd) { if (pins.size() < kMax) setAdding(true); return; }
+        if (kind == KBack) { setAdding(false); return; }
+        if (kind == KBrowse) { browseApp(); return; }
+        if (adding) {
+            if (idx >= 0 && idx < apps.size() && pins.size() < kMax) { pins.push_back(apps[idx]); savePins(); }
+            setAdding(false); return;
+        }
+        if (kind == KAll) { if (idx >= 0 && idx < apps.size()) { launchApp(apps[idx]); q->clear(); } return; }
+        if (idx >= 0 && idx < pins.size()) { launchApp(pins[idx]); q->clear(); }
+    }
+
+    // pick any .exe / shortcut / .app by hand and add it to the list (for apps the scan cannot find)
+    void browseApp() {
+#ifdef Q_OS_WIN
+        const QString filter = "apps (*.exe *.lnk *.bat *.cmd)";
+#else
+        const QString filter = "apps (*)";
+#endif
+        QString f = QFileDialog::getOpenFileName(nullptr, "choose an app to add", QDir::homePath(), filter);
+        if (f.isEmpty() || pins.size() >= kMax) return;
+        QString n = QFileInfo(f).completeBaseName();
+        if (n.compare("code", Qt::CaseInsensitive) == 0) n = "Visual Studio Code";
+        App a{n, f, "", "", ""};
+        if (!isPinned(a)) { pins.push_back(a); savePins(); }
+        setAdding(false);
+    }
+
+    // ---- right click on an app
+    void menuAt(const QPoint& pos) {
+        auto it = l->itemAt(pos);
+        if (!it || adding) return;
+        int kind = it->data(Qt::UserRole + 1).toInt(), i = it->data(Qt::UserRole).toInt();
+        QMenu m;
+        if (kind == KAll) {
+            if (i < 0 || i >= apps.size()) return;
+            if (pins.size() < kMax) m.addAction("add to my list", [this, i] { pins.push_back(apps[i]); savePins(); q->clear(); fill(); });
+        } else if (kind == KApp) {
+            if (i < 0 || i >= pins.size()) return;
+            m.addAction("rename...", [this, i] { renamePin(i); });
+            if (!pins[i].orig.isEmpty() && pins[i].orig != pins[i].name)
+                m.addAction("reset name", [this, i] { pins[i].name = pins[i].orig; pins[i].orig.clear(); savePins(); fill(); });
+            m.addAction("change icon...", [this, i] { pickIcon(i); });
+            if (!pins[i].custom.isEmpty()) m.addAction("reset icon", [this, i] { pins[i].custom.clear(); savePins(); cache.clear(); fill(); });
+            m.addSeparator();
+            m.addAction("remove from list", [this, i] { pins.removeAt(i); savePins(); fill(); });
+        } else return;
+        m.exec(l->viewport()->mapToGlobal(pos));
+    }
+    // the new name is only used inside this launcher: the real app and its shortcut are not touched
+    void renamePin(int i) {
+        bool ok = false;
+        QString n = QInputDialog::getText(nullptr, "rename", "name shown in the launcher (the real app is not changed):",
+                                          QLineEdit::Normal, pins[i].name, &ok).trimmed();
+        if (!ok || n.isEmpty() || n == pins[i].name) return;
+        if (pins[i].orig.isEmpty()) pins[i].orig = pins[i].name;
+        pins[i].name = n; savePins(); fill();
+    }
+    void pickIcon(int i) {
+        QString f = QFileDialog::getOpenFileName(nullptr, "choose icon for " + pins[i].name, QDir::homePath(),
+                                                 "images (*.png *.ico *.jpg *.jpeg *.bmp *.webp *.svg)");
+        if (f.isEmpty()) return;
+        if (QPixmap(f).isNull()) { QMessageBox::warning(nullptr, "BetterWidgets", "could not read that image. try a .png or .ico file."); return; }
+        QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/icons"; QDir().mkpath(dir);
+        QString dst = dir + "/" + QString::fromLatin1(QCryptographicHash::hash(pins[i].target.toUtf8(), QCryptographicHash::Md5).toHex())
+                      + "." + QFileInfo(f).suffix();
+        if (f != dst) { QFile::remove(dst); if (!QFile::copy(f, dst)) dst = f; }
+        pins[i].custom = dst; savePins(); cache.clear(); fill();
+    }
+
+    bool eventFilter(QObject* o, QEvent* e) override {
+        if (o == q && e->type() == QEvent::KeyPress) {
+            int k = static_cast<QKeyEvent*>(e)->key();
+            if (k == Qt::Key_Down || k == Qt::Key_Up) {
+                l->setCurrentRow(qBound(0, l->currentRow() + (k == Qt::Key_Down ? 1 : -1), qMax(0, int(l->count()) - 1))); return true;
+            }
+            if (k == Qt::Key_Escape) { if (adding) setAdding(false); else q->clear(); return true; }
+        }
+        return Glass::eventFilter(o, e);
+    }
+    void showEvent(QShowEvent* e) override {
+        Glass::showEvent(e);
+        QTimer::singleShot(0, this, [this] { l->syncPill(false); });
+    }
+    QString css() override {
+        return "QLineEdit{background:#f4f4ee;color:#222;border-radius:12px;padding:6px 10px;}"
+               "QListWidget{background:transparent;outline:0;font-size:14px;font-weight:600;}"
+               "QListWidget::item{padding:0 8px;border-radius:12px;background:transparent;}"
+               "QListWidget::item:hover{background:transparent;}"
+               "QListWidget::item:selected{background:transparent;color:#1a1a1a;}";
+    }
+};
+
+// ---------------------------------------------------------------- clock (always english day / month names)
+class Clock : public Glass {
+    Q_OBJECT
+    QLabel *t, *s, *d;
+public:
+    Clock() : Glass("clock", {260, 140}, {340, 78}) {
+        auto v = new QVBoxLayout(this); auto h = new QHBoxLayout;
+        v->setContentsMargins(0, 20, 0, 4);   // pushes both the time and the date down (raise the 20 to push further)
+        t = new QLabel; t->setObjectName("big"); s = new QLabel; s->setObjectName("sec"); d = new QLabel; d->setAlignment(Qt::AlignCenter);
+        h->addStretch(); h->addWidget(t); h->addWidget(s, 0, Qt::AlignBottom); h->addStretch();
+        v->addLayout(h); v->addWidget(d);
+        auto tm = new QTimer(this); connect(tm, &QTimer::timeout, this, [this] { tick(); }); tm->start(1000);
+        restyle(); tick();
+    }
+    void tick() {
+        const QLocale en(QLocale::English, QLocale::UnitedStates);
+        auto n = QDateTime::currentDateTime();
+        t->setText(en.toString(n, cfg().h24 ? "HH:mm" : "h:mm"));
+        s->setText(cfg().secs ? en.toString(n, cfg().h24 ? "ss" : "ss ap") : ""); s->setVisible(cfg().secs);
+        d->setText(en.toString(n.date(), "dddd, MMMM d"));
+    }
+    void restyle() override { Glass::restyle(); tick(); }
+    QString css() override { return "#big{font-size:50px;font-weight:700;} #sec{font-size:18px;color:ACC2;margin-bottom:8px;}"; }
+};
+
+// ---------------------------------------------------------------- system card (profile picture + specs)
+static QString osLine() {
+#ifdef Q_OS_MAC
+    return "macos " + QSysInfo::productVersion() + " (" + sh("sw_vers", {"-buildVersion"}) + ")";
+#else
+    return QSysInfo::prettyProductName().toLower();
+#endif
+}
+static QString shellLine() {
+#ifdef Q_OS_WIN
+    return "powershell";
+#else
+    QString p = qEnvironmentVariable("SHELL"); if (p.isEmpty()) return "-";
+    auto m = QRegularExpression("\\d+(\\.\\d+)+").match(sh(p, {"--version"}));
+    return QFileInfo(p).fileName() + (m.hasMatch() ? " " + m.captured() : "");
+#endif
+}
+static QString cpuName() {
+#ifdef Q_OS_MAC
+    return sh("sysctl", {"-n", "machdep.cpu.brand_string"});
+#elif defined(Q_OS_WIN)
+    return QSettings("HKEY_LOCAL_MACHINE\\HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", QSettings::NativeFormat)
+        .value("ProcessorNameString", "unknown").toString().trimmed();
+#else
+    QFile f("/proc/cpuinfo");
+    if (f.open(QIODevice::ReadOnly))
+        for (auto& ln : f.readAll().split('\n'))
+            if (ln.startsWith("model name")) return QString::fromUtf8(ln.mid(ln.indexOf(':') + 1)).trimmed();
+    return QSysInfo::currentCpuArchitecture();
+#endif
+}
+
+// "11th Gen Intel(R) Core(TM) i9-11900 @ 2.50GHz" -> "Intel Core i9-11900"
+static QString tidyCpu(QString s) {
+    s.remove("(R)").remove("(TM)").remove("(r)").remove("(tm)");
+    s.remove(QRegularExpression("\\s+CPU\\b"));
+    s.remove(QRegularExpression("\\s*@.*$"));
+    s.remove(QRegularExpression("^\\d+(st|nd|rd|th) Gen\\s+"));
+    return s.simplified();
+}
+
+// layout: big square picture on the left; next to it the "admin: name" line, a gap, then three spec lines (all vertically
+// centred on the picture); the storage + cpu lines sit at the very bottom of the card, spanning the full width
+class SysInfo : public Glass {
+    Q_OBJECT
+    QToolButton* av; QLabel *name, *info, *low; QString user;
+    static constexpr int kAv = 124, kGapLow = 15, kW = 370;   // bigger picture, 15px gap above the bottom lines, wider card (set kW = 340 for the old width)
+public:
+    SysInfo() : Glass("sysinfo", {kW, 184}, {620, 40}) {
+        user = qEnvironmentVariable("USER", qEnvironmentVariable("USERNAME", "user"));
+        auto v = new QVBoxLayout(this); v->setContentsMargins(14, 12, 14, 12); v->setSpacing(0);
+        auto top = new QHBoxLayout; top->setSpacing(14);
+        av = new QToolButton; av->setObjectName("avatar"); av->setFixedSize(kAv, kAv); av->setIconSize({kAv, kAv});
+        av->setCursor(Qt::PointingHandCursor); av->setToolTip("click to change picture");
+        name = new QLabel(this); name->setObjectName("name");     // name + info are placed by hand in placeText()
+        info = new QLabel(this); info->setObjectName("info");
+        low = new QLabel; low->setObjectName("low");
+        // the card keeps a fixed compact size: long lines wrap instead of stretching the widget
+        for (auto* lb : {name, info, low}) { lb->setWordWrap(true); lb->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred); }
+        setFixedWidth(kW);                     // the height is worked out in restyle() from the picture + text sizes
+        top->addWidget(av, 0, Qt::AlignTop); top->addStretch(1);   // picture on the left; the text is positioned in placeText()
+        v->addLayout(top);
+        v->addSpacing(kGapLow);                // exactly 15px between the picture block and the two bottom lines
+        v->addWidget(low);
+        connect(av, &QToolButton::clicked, this, [this] {
+            QString f = QFileDialog::getOpenFileName(nullptr, "choose picture", QDir::homePath(), "images (*.png *.jpg *.jpeg *.webp *.bmp)");
+            if (!f.isEmpty()) { cfg().avatar = f; saveCfg(); setAvatar(); }
+        });
+        auto tm = new QTimer(this); connect(tm, &QTimer::timeout, this, [this] { update_(); }); tm->start(30000);
+        restyle();
+    }
+    void setAvatar() {
+        QPixmap px; if (!cfg().avatar.isEmpty()) px.load(cfg().avatar);
+        av->setIcon(QIcon(px.isNull() ? letterTile(user, kAv, 22) : roundedSq(px, kAv, 22)));
+    }
+    void update_() {
+        static const QString os = osLine(), shell = shellLine(), cpu = tidyCpu(cpuName());
+        const double G = 1073741824.0; QStorageInfo st = QStorageInfo::root();
+        double tot = st.bytesTotal() / G, fr = st.bytesAvailable() / G;
+        name->setText("admin: " + user);
+        info->setText(QString("%1<br>%2 GB &bull; %3<br>shell %4")
+            .arg(os, QString::number(ramGB(), 'f', 0), QSysInfo::currentCpuArchitecture(), shell));
+        low->setText(QString("%1Gi total / %2Gi used / %3Gi free<br>cpu %4 (%5 cores)")
+            .arg(tot, 0, 'f', 0).arg(tot - fr, 0, 'f', 0).arg(fr, 0, 'f', 0).arg(cpu).arg(QThread::idealThreadCount()));
+    }
+    void restyle() override {
+        Glass::restyle(); setAvatar();
+        QFont lf(cfg().font); lf.setPixelSize(12); lf.setWeight(QFont::DemiBold);
+        int lowH = 2 * QFontMetrics(lf).lineSpacing() + 2;       // two bottom lines
+        low->setFixedHeight(lowH);
+        setFixedSize(kW, 12 + kAv + kGapLow + lowH + 12);
+        update_(); placeText();
+    }
+    // the 3 spec lines are centred on the card's own middle (vertically); the admin line sits 15px above them
+    void placeText() {
+        QFont nf(cfg().font); nf.setPixelSize(15); nf.setWeight(QFont::Bold);
+        QFont inf(cfg().font); inf.setPixelSize(12); inf.setWeight(QFont::DemiBold);
+        const int x = 14 + kAv + 14, w = kW - x - 14;
+        const int nameH = QFontMetrics(nf).lineSpacing() + 2, infoH = 3 * QFontMetrics(inf).lineSpacing() + 2;
+        const int infoY = height() / 2 - infoH / 2, nameY = infoY - 15 - nameH;
+        info->setGeometry(x, infoY, w, infoH);
+        name->setGeometry(x, nameY, w, nameH);
+    }
+    QString css() override {
+        return "#name{font-size:15px;font-weight:700;color:ACC2;} #info{font-size:12px;font-weight:600;} "
+               "#low{font-size:12px;font-weight:600;} #avatar{border:none;background:transparent;}";
+    }
+};
+
+// ---------------------------------------------------------------- github activity (compact, reference-style)
+class Github : public Glass {
+    Q_OBJECT
+    QNetworkAccessManager nam; QMap<QDate, int> lv; QString msg = "set your github username in settings"; QTimer tm; QString lastUser;
+public:
+    Github() : Glass("github", {560, 224}, {340, 232}) {
+        connect(&tm, &QTimer::timeout, this, [this] { fetch(); });
+        connect(&bus(), &Bus::changed, this, [this] {
+            if (cfg().user != lastUser) fetch(); else tm.start(qMax(5, cfg().refresh) * 60000);
+        });
+        restyle(); fetch();
+    }
+    void fetch() {
+        lastUser = cfg().user;
+        tm.start(qMax(5, cfg().refresh) * 60000);
+        if (cfg().user.isEmpty()) { msg = "set your github username in settings"; update(); return; }
+        msg = "loading..."; update();
+        QNetworkRequest r(QUrl("https://github.com/users/" + cfg().user + "/contributions"));
+        r.setHeader(QNetworkRequest::UserAgentHeader, "BetterWidgets");
+        r.setRawHeader("Accept-Language", "en-US,en;q=0.9");
+        auto rep = nam.get(r);
+        connect(rep, &QNetworkReply::finished, this, [this, rep] {
+            rep->deleteLater();
+            if (rep->error()) { msg = "could not reach github"; update(); return; }
+            parse(QString::fromUtf8(rep->readAll()));
+        });
+    }
+    void parse(const QString& h) {
+        lv.clear();
+        QRegularExpression tag("<td[^>]*>"), d("data-date=\"(\\d{4}-\\d\\d-\\d\\d)\""), l("data-level=\"(\\d)\"");
+        auto it = tag.globalMatch(h);
+        while (it.hasNext()) {
+            auto t = it.next().captured(); auto a = d.match(t), b = l.match(t);
+            if (a.hasMatch() && b.hasMatch()) lv[QDate::fromString(a.captured(1), Qt::ISODate)] = b.captured(1).toInt();
+        }
+        msg = lv.isEmpty() ? "no data found" : ""; update();
+    }
+    static QColor lc(int l) { if (!l) return QColor(255, 255, 255, 28); QColor c = cfg().accent2; c.setAlpha(qMin(255, 55 + l * 50)); return c; }
+    static QColor ringColor(int l) { return l == 0 ? QColor(255, 255, 255, 70) : lc(l); }
+protected:
+    void mouseDoubleClickEvent(QMouseEvent*) override { openSettings(); }
+    void paintEvent(QPaintEvent* e) override {
+        Glass::paintEvent(e);
+        QPainter p(this); p.setRenderHint(QPainter::Antialiasing);
+        const int W = width(), H = height();      // 560x224, drawn 1:1
+        const int right = W - 20;                  // right edge shared by the badge, the ring column and the legend
+        // title (smaller) + badge
+        QFont f(cfg().font); f.setPointSize(10); f.setWeight(QFont::DemiBold); p.setFont(f); p.setPen(QColor("#e6fff6"));
+        p.drawText(24, 32, "github activity");
+        QRect badge(right - 100, 12, 100, 22);
+        p.setBrush(cfg().accent); p.setPen(Qt::NoPen); p.drawRoundedRect(badge, 9, 9);
+        f.setPointSize(8); p.setFont(f); p.setPen(QColor("#1a1a1a")); p.drawText(badge, Qt::AlignCenter, "last 3 months");
+        p.setPen(QColor("#e6fff6"));
+        if (!msg.isEmpty()) { f.setWeight(QFont::Normal); f.setPointSize(11); p.setFont(f); p.drawText(QRect(0, 0, W, H).adjusted(20, 44, -20, -14), Qt::AlignCenter, msg); return; }
+
+        // heatmap: 17 weeks. wider horizontal gap (hp) than vertical gap (vp)
+        constexpr int hp = 22, vp = 17, cell = 12, gx = 24, gy = 64, weeks = 17;
+        static const char* mon[] = {"jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"};
+        f.setWeight(QFont::Medium); f.setPointSize(8); p.setFont(f);
+        QDate today = QDate::currentDate(), start = today.addDays(-(weeks - 1) * 7);
+        start = start.addDays(-(start.dayOfWeek() % 7));
+        int total = 0, cnt[5] = {0, 0, 0, 0, 0};
+        for (QDate d = start; d <= today; d = d.addDays(1)) {
+            int col = start.daysTo(d) / 7, row = d.dayOfWeek() % 7, x = gx + col * hp, y = gy + row * vp;
+            int level = qBound(0, lv.value(d, 0), 4); total++; cnt[level]++;
+            p.setPen(Qt::NoPen); p.setBrush(lc(level)); p.drawRoundedRect(x, y, cell, cell, 3, 3);
+            if (row == 0 && d.day() <= 7) { p.setPen(QColor("#bfe")); p.drawText(x, gy - 8, QString(mon[d.month() - 1])); }
+        }
+
+        // ring: a full grey track that is never cut, with the colour pills sitting INSIDE it (pills are 4px thinner than the track).
+        // only the levels that really exist get a pill (2 colours = 2 pills). each pill is exactly as long as its share of all days
+        // (grey = the empty days counts too). the smallest a pill can get is a round dot, so a 5% share still shows as a dot
+        const double r = 54, pw = 10, track = pw + 4, outerR = r + track / 2;
+        const double lw = outerR * 2 * 1.1;                      // legend is 10% longer than the ring
+        const double cx = right - lw / 2;                        // ring is centred over the legend / badge column
+        const double cy = gy + (6 * vp + cell) / 2.0;            // exact vertical centre of the calendar grid
+        QPointF c(cx, cy);
+        QRectF rr(cx - r, cy - r, 2 * r, 2 * r);
+        p.setBrush(Qt::NoBrush);
+        p.setPen(QPen(QColor(255, 255, 255, 40), track)); p.drawEllipse(c, r, r);
+        const double capDeg = (pw / 2) / r * 57.29578;           // how far a round cap sticks out, in degrees
+        int used = 0; for (int i = 0; i < 5; ++i) if (cnt[i]) ++used;
+        // every pill gets an exact slice of the circle. a slice is never smaller than one round dot (cap to cap + a hair of gap),
+        // and the slices of the bigger pills shrink to pay for that, so the pills can never run into each other
+        const double gapDeg = 1.0, minLen = 2 * capDeg + gapDeg + 0.5;
+        double L[5] = {0, 0, 0, 0, 0}; bool fix[5] = {false, false, false, false, false};
+        for (int i = 0; i < 5; ++i) if (cnt[i] && total) L[i] = 360.0 * cnt[i] / total;
+        for (int pass = 0; pass < 6; ++pass) {
+            double budget = 360, freeCnt = 0;
+            for (int i = 0; i < 5; ++i) if (cnt[i]) { if (fix[i]) budget -= minLen; else freeCnt += cnt[i]; }
+            bool changed = false;
+            for (int i = 0; i < 5; ++i) if (cnt[i] && !fix[i] && freeCnt > 0) {
+                L[i] = budget * cnt[i] / freeCnt;
+                if (L[i] < minLen) { fix[i] = true; changed = true; }
+            }
+            if (!changed) break;
+        }
+        for (int i = 0; i < 5; ++i) if (fix[i]) L[i] = minLen;
+        double startDeg = 90;                                    // 12 o'clock, going clockwise
+        for (int i = 4; i >= 0 && total; --i) {
+            if (!cnt[i]) continue;                               // no empty slots: levels with no days get no pill
+            p.setPen(QPen(ringColor(i), pw, Qt::SolidLine, Qt::RoundCap));
+            if (used == 1) p.drawEllipse(c, r, r);               // a single level fills the whole circle
+            else {
+                double mid = startDeg - L[i] / 2;                // centre of this pill's slice
+                double s = qMax(0.1, L[i] - gapDeg - 2 * capDeg);   // arc length without the caps (0.1 = a round dot)
+                p.drawArc(rr, int((mid + s / 2) * 16), int(-s * 16));   // same radius as the track, so every pill hugs the circle
+            }
+            startDeg -= L[i];
+        }
+
+        // legend: 10% longer than the ring, right edge lines up with the "last 3 months" badge
+        f.setPointSize(7); f.setWeight(QFont::Medium); p.setFont(f);
+        const QFontMetrics fm = p.fontMetrics();
+        const int lessW = fm.horizontalAdvance("less"), moreW = fm.horizontalAdvance("more"), sq = 10, padX = 9, gap = 6, bh = 20;
+        const int bw = int(lw + 0.5), bx = right - bw, by = int(cy + outerR) + 10;
+        const double step = (bw - 2 * padX - lessW - moreW - 2 * gap - sq) / 4.0;
+        p.setBrush(QColor(255, 255, 255, 22)); p.setPen(QColor(255, 255, 255, 45)); p.drawRoundedRect(bx, by, bw, bh, 8, 8);
+        p.setPen(QColor("#e6fff6"));
+        p.drawText(QRect(bx + padX, by, lessW, bh), Qt::AlignVCenter | Qt::AlignLeft, "less");
+        p.drawText(QRect(bx + bw - padX - moreW, by, moreW, bh), Qt::AlignVCenter | Qt::AlignRight, "more");
+        const double lx = bx + padX + lessW + gap;
+        for (int i = 0; i < 5; ++i) { p.setPen(Qt::NoPen); p.setBrush(lc(i)); p.drawRoundedRect(QRectF(lx + i * step, by + (bh - sq) / 2.0, sq, sq), 2, 2); }
+    }
+};
+
+// ---------------------------------------------------------------- anime: catalog + covers
+struct Show { int id = 0; QString t, cover, url; int ep = 0, total = 0; bool airing = false; };   // total 0 = unknown
+
+// Crunchyroll has no public API, so the catalog comes from AniList (public, no key): every anime AniList lists as
+// licensed by Crunchyroll (airing + finished), fetched page by page in the background and cached on disk.
+// If that filter ever fails, it falls back to "currently airing anime that have a Crunchyroll link".
+class Catalog : public QObject {
+    Q_OBJECT
+    QNetworkAccessManager nam; QList<Show> list, acc; QTimer tm; QDateTime last; bool busy_ = false, fallback = false;
+public:
+    static Catalog& get() { static Catalog c; return c; }
+    const QList<Show>& items() const { return list; }
+    bool busy() const { return busy_; }
+    int loaded() const { return acc.size(); }
+    void refreshIfStale() { if (!last.isValid() || last.secsTo(QDateTime::currentDateTime()) > 3600) fetch(); }
+    void fetch() { if (busy_) return; busy_ = true; fallback = false; acc.clear(); page(1); }
+signals: void updated();
+private:
+    static QString cachePath() {
+        QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation); QDir().mkpath(dir);
+        return dir + "/crunchyroll.json";
+    }
+    Catalog() {
+        QFile f(cachePath());
+        if (f.open(QIODevice::ReadOnly)) {
+            for (auto v : QJsonDocument::fromJson(f.readAll()).array()) {
+                auto o = v.toObject();
+                list.push_back({o["id"].toInt(), o["t"].toString(), o["c"].toString(), o["u"].toString(), 0, o["n"].toInt(), o["a"].toBool()});
+            }
+            last = QFileInfo(cachePath()).lastModified();
+        }
+        connect(&tm, &QTimer::timeout, this, [this] { fetch(); }); tm.start(6 * 3600 * 1000);
+        fetch();
+    }
+    void finish() {
+        if (!acc.isEmpty()) {
+            list = acc; last = QDateTime::currentDateTime();
+            std::stable_sort(list.begin(), list.end(), [](const Show& a, const Show& b) { return a.airing && !b.airing; });   // airing first
+            QJsonArray a;
+            for (auto& s : list) a.append(QJsonObject{{"id", s.id}, {"t", s.t}, {"c", s.cover}, {"u", s.url}, {"n", s.total}, {"a", s.airing}});
+            QFile f(cachePath()); if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) f.write(QJsonDocument(a).toJson(QJsonDocument::Compact));
+        }
+        busy_ = false; emit updated();
+    }
+    void page(int n) {
+        static const QString qAll = R"gql(query($page:Int){Page(page:$page,perPage:50){pageInfo{hasNextPage}
+            media(type:ANIME,isAdult:false,licensedBy:"Crunchyroll",sort:POPULARITY_DESC){id status title{romaji english}episodes
+            coverImage{medium}externalLinks{site url}}}})gql";
+        static const QString qAir = R"gql(query($page:Int){Page(page:$page,perPage:50){pageInfo{hasNextPage}
+            media(type:ANIME,status:RELEASING,isAdult:false,sort:POPULARITY_DESC){id status title{romaji english}episodes
+            coverImage{medium}externalLinks{site url}}}})gql";
+        QJsonObject body{{"query", fallback ? qAir : qAll}, {"variables", QJsonObject{{"page", n}}}};
+        QNetworkRequest r{QUrl("https://graphql.anilist.co")};
+        r.setHeader(QNetworkRequest::ContentTypeHeader, "application/json"); r.setRawHeader("Accept", "application/json");
+        auto rep = nam.post(r, QJsonDocument(body).toJson(QJsonDocument::Compact));
+        connect(rep, &QNetworkReply::finished, this, [this, rep, n] {
+            rep->deleteLater();
+            int code = rep->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+            if (code == 429) { QTimer::singleShot(61000, this, [this, n] { page(n); }); return; }   // rate limited: wait a minute, continue
+            auto doc = QJsonDocument::fromJson(rep->readAll()).object();
+            if ((rep->error() || doc.contains("errors")) && n == 1 && !fallback) { fallback = true; page(1); return; }
+            if (rep->error()) { finish(); return; }
+            auto pg = doc["data"].toObject()["Page"].toObject();
+            for (auto v : pg["media"].toArray()) {
+                auto m = v.toObject(); QString url;
+                for (auto e : m["externalLinks"].toArray())
+                    if (e.toObject()["site"].toString() == "Crunchyroll") url = e.toObject()["url"].toString();
+                auto t = m["title"].toObject();
+                QString name = t["english"].isString() ? t["english"].toString() : t["romaji"].toString();
+                if (url.isEmpty()) { if (fallback) continue; url = "https://www.crunchyroll.com/search?q=" + QString::fromUtf8(QUrl::toPercentEncoding(name)); }
+                acc.push_back({m["id"].toInt(), name, m["coverImage"].toObject()["medium"].toString(), url, 0, m["episodes"].toInt(),
+                               m["status"].toString() == "RELEASING"});
+            }
+            bool more = pg["pageInfo"].toObject()["hasNextPage"].toBool() && n < 70;
+            if (!more) { finish(); return; }
+            if (n == 1 || n % 6 == 0) { if (list.isEmpty()) list = acc; emit updated(); }    // show something early while the rest loads
+            QTimer::singleShot(400, this, [this, n] { page(n + 1); });
+        });
+    }
+};
+
+// poster icon: disk-cached, downloaded once
+static void fetchCover(int id, const QString& url, QObject* ctx, std::function<void(QPixmap)> cb) {
+    QString dir = QStandardPaths::writableLocation(QStandardPaths::CacheLocation) + "/covers";
+    QDir().mkpath(dir); QString path = QString("%1/%2.jpg").arg(dir).arg(id);
+    QPixmap px;
+    if (QFile::exists(path) && px.load(path)) { cb(roundedSq(px, 40, 10)); return; }
+    if (url.isEmpty()) return;
+    static QNetworkAccessManager nam;
+    QNetworkRequest r{QUrl(url)}; r.setHeader(QNetworkRequest::UserAgentHeader, "BetterWidgets");
+    auto rep = nam.get(r);
+    QObject::connect(rep, &QNetworkReply::finished, rep, &QObject::deleteLater);
+    QObject::connect(rep, &QNetworkReply::finished, ctx, [=] {
+        if (rep->error()) return;
+        QByteArray d = rep->readAll(); QPixmap p; if (!p.loadFromData(d)) return;
+        QFile f(path); if (f.open(QIODevice::WriteOnly)) f.write(d);
+        cb(roundedSq(p, 40, 10));
+    });
+}
+
+// thick dashed rectangle with a plus in the middle; hosts the expandable crunchyroll list
+class DashedBox : public QWidget {
+    Q_OBJECT
+    bool hover = false;
+public:
+    bool open = false;
+    DashedBox() { setMinimumHeight(56); setCursor(Qt::PointingHandCursor); }
+signals: void clicked();
+protected:
+    void enterEvent(QEnterEvent*) override { hover = true; update(); }
+    void leaveEvent(QEvent*) override { hover = false; update(); }
+    void mousePressEvent(QMouseEvent* e) override {
+        if (!open && e->button() == Qt::LeftButton) emit clicked(); else QWidget::mousePressEvent(e);
+    }
+    void paintEvent(QPaintEvent*) override {
+        QPainter p(this); p.setRenderHint(QPainter::Antialiasing);
+        QColor c = cfg().accent2; c.setAlpha(hover || open ? 210 : 140);
+        QPen pen(c, 2.6); pen.setDashPattern({2.2, 1.8});
+        p.setPen(pen); p.setBrush(QColor(255, 255, 255, hover && !open ? 18 : 8));
+        p.drawRoundedRect(QRectF(rect()).adjusted(2, 2, -2, -2), 14, 14);
+        if (!open) {
+            QPointF m = QRectF(rect()).center(); p.setPen(QPen(c, 3, Qt::SolidLine, Qt::RoundCap));
+            p.drawLine(m + QPointF(-9, 0), m + QPointF(9, 0)); p.drawLine(m + QPointF(0, -9), m + QPointF(0, 9));
+        }
+    }
+};
+
+// label that never forces its parent wider: text longer than the space it gets is cut with "..."
+class ElideLabel : public QLabel {
+    QString full;
+public:
+    explicit ElideLabel(const QString& t) : full(t) {
+        setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred); setMinimumWidth(0); setToolTip(t); QLabel::setText(t);
+    }
+    QSize sizeHint() const override { return {0, QLabel::sizeHint().height()}; }
+    QSize minimumSizeHint() const override { return {0, QLabel::minimumSizeHint().height()}; }
+protected:
+    void resizeEvent(QResizeEvent* e) override { QLabel::resizeEvent(e); reelide(); }
+    void changeEvent(QEvent* e) override {
+        QLabel::changeEvent(e);
+        if (e->type() == QEvent::FontChange || e->type() == QEvent::StyleChange) reelide();
+    }
+private:
+    void reelide() {
+        QString s = fontMetrics().elidedText(full, Qt::ElideRight, qMax(0, width()));
+        if (s != text()) QLabel::setText(s);
+    }
+};
+
+// ---------------------------------------------------------------- currently watching (max 2 shows)
+//  - the dashed "+" box disappears while 2 shows are on the list, and comes back when you remove one
+//  - a newly added show pops in with a bouncy grow + fade animation
+class Watching : public Glass {
+    Q_OBJECT
+    static constexpr int kMaxShows = 2, kRowH = 64, kGap = 6;
+    QVBoxLayout* rows; QScrollArea* sc; QList<Show> shows;
+    DashedBox* box; QWidget* panel; QLineEdit* flt; QListWidget* cat;
+    QHash<int, QPixmap> covers; QSet<int> pending; QHash<QChar, QPixmap> tiles;
+public:
+    Watching() : Glass("watching", {380, 100}, {580, 480}) {
+        for (auto v : QJsonDocument::fromJson(QSettings().value("shows").toString().toUtf8()).array()) {
+            auto o = v.toObject();
+            if (shows.size() >= kMaxShows) break;
+            shows.push_back({o["id"].toInt(), o["t"].toString(), o["cover"].toString(), o["url"].toString(), o["ep"].toInt(), o["total"].toInt()});
+        }
+        setFixedWidth(380);
+        auto v = new QVBoxLayout(this); v->setContentsMargins(12, 10, 12, 12); v->setSpacing(8);
+        v->addWidget(new QLabel("currently watching"));
+        sc = new QScrollArea; sc->setFrameShape(QFrame::NoFrame); sc->setWidgetResizable(true);
+        sc->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff); sc->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        sc->viewport()->setAutoFillBackground(false);
+        auto host = new QWidget; host->setObjectName("host");
+        rows = new QVBoxLayout(host); rows->setContentsMargins(0, 0, 0, 0); rows->setSpacing(kGap);
+        sc->setWidget(host); v->addWidget(sc);
+
+        box = new DashedBox; v->addWidget(box);
+        auto bl = new QVBoxLayout(box); bl->setContentsMargins(10, 10, 10, 10);
+        panel = new QWidget; panel->hide(); bl->addWidget(panel);
+        auto pv = new QVBoxLayout(panel); pv->setContentsMargins(0, 0, 0, 0); pv->setSpacing(8);
+        auto top = new QHBoxLayout; flt = new QLineEdit; flt->setPlaceholderText("search crunchyroll...");
+        auto close = new QToolButton; close->setText("\u00d7"); close->setObjectName("close");
+        top->addWidget(flt, 1); top->addWidget(close); pv->addLayout(top);
+        cat = new QListWidget; cat->setFrameShape(QFrame::NoFrame); cat->setFocusPolicy(Qt::NoFocus); cat->setIconSize({40, 40});
+        cat->setMinimumHeight(380); cat->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel); cat->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        pv->addWidget(cat);
+
+        connect(box, &DashedBox::clicked, this, [this] { setOpen(true); });
+        connect(close, &QToolButton::clicked, this, [this] { setOpen(false); });
+        connect(flt, &QLineEdit::textChanged, this, [this] { fillCatalog(); });
+        connect(cat, &QListWidget::itemClicked, this, [this](QListWidgetItem* it) { add(it->data(Qt::UserRole).toInt()); });
+        connect(cat->verticalScrollBar(), &QScrollBar::valueChanged, this, [this] { loadVisible(); });
+        connect(&Catalog::get(), &Catalog::updated, this, [this] { fillCatalog(); });
+        restyle(); rebuild();
+    }
+    // restyle runs on every settings change: re-apply the 2-show rule so the dashed box can never reappear at the limit
+    void restyle() override { Glass::restyle(); tiles.clear(); box->setVisible(shows.size() < kMaxShows); box->update(); }
+
+    QPixmap tileFor(const QString& t) {
+        QChar k = t.isEmpty() ? QChar('?') : t[0].toUpper();
+        if (!tiles.contains(k)) tiles[k] = letterTile(QString(k), 40, 10);
+        return tiles[k];
+    }
+    void requestCover(int id, const QString& url) {
+        if (!id || covers.contains(id) || pending.contains(id)) return;
+        pending.insert(id);
+        fetchCover(id, url, this, [this, id](QPixmap p) { gotCover(id, p); });
+    }
+    QPixmap coverFor(const Show& s) { requestCover(s.id, s.cover); return covers.contains(s.id) ? covers[s.id] : tileFor(s.t); }
+    void gotCover(int id, const QPixmap& p) {
+        covers[id] = p;
+        for (auto* lb : findChildren<QLabel*>(QString("cv%1").arg(id))) lb->setPixmap(p);
+        for (int i = 0; i < cat->count(); ++i) if (cat->item(i)->data(Qt::UserRole).toInt() == id) { cat->item(i)->setIcon(QIcon(p)); break; }
+    }
+    // only download posters for the rows you can actually see (the catalog has ~1000+ shows)
+    void loadVisible() {
+        if (!box->open) return;
+        int r0 = qMax(0, cat->indexAt(QPoint(8, 8)).row());
+        for (int i = r0; i < qMin(cat->count(), r0 + 12); ++i) {
+            int id = cat->item(i)->data(Qt::UserRole).toInt();
+            if (id) requestCover(id, cat->item(i)->data(Qt::UserRole + 1).toString());
+        }
+    }
+    void save() {
+        QJsonArray a;
+        for (auto& s : shows) a.append(QJsonObject{{"id", s.id}, {"t", s.t}, {"cover", s.cover}, {"url", s.url}, {"ep", s.ep}, {"total", s.total}});
+        QSettings().setValue("shows", QString::fromUtf8(QJsonDocument(a).toJson(QJsonDocument::Compact)));
+    }
+    bool watching(int id) const { for (auto& s : shows) if (s.id == id) return true; return false; }
+    void refit() { layout()->activate(); adjustSize(); QTimer::singleShot(0, this, [this] { adjustSize(); }); }
+    // scroll area is exactly as tall as the rows inside it (rows animate their own height)
+    void syncRows() {
+        int h = 0, n = 0;
+        for (int i = 0; i < rows->count(); ++i) if (auto w = rows->itemAt(i)->widget()) { h += w->maximumHeight(); ++n; }
+        if (n > 1) h += (n - 1) * kGap;
+        sc->setFixedHeight(h); sc->setVisible(n > 0);
+        layout()->activate(); adjustSize();
+    }
+
+    void setOpen(bool o) {
+        if (o && shows.size() >= kMaxShows) return;
+        box->open = o; panel->setVisible(o); box->setMinimumHeight(o ? 0 : 56); box->update();
+        if (o) { flt->clear(); fillCatalog(); Catalog::get().refreshIfStale(); flt->setFocus(); }
+        refit();
+    }
+    void fillCatalog() {
+        if (!box->open) return;
+        cat->clear(); QString f = flt->text().trimmed();
+        for (auto& s : Catalog::get().items()) {
+            if (watching(s.id) || (!f.isEmpty() && !s.t.contains(f, Qt::CaseInsensitive))) continue;
+            QStringList sub; if (s.total) sub << QString("%1 episodes").arg(s.total); if (s.airing) sub << "airing";
+            auto it = new QListWidgetItem(QIcon(covers.contains(s.id) ? covers[s.id] : tileFor(s.t)),
+                                          s.t.toLower() + (sub.isEmpty() ? QString() : "\n" + sub.join(" \u2022 ")));
+            it->setData(Qt::UserRole, s.id); it->setData(Qt::UserRole + 1, s.cover); cat->addItem(it);
+        }
+        if (!cat->count()) {
+            auto it = new QListWidgetItem(Catalog::get().busy() ? "loading crunchyroll list..." : "nothing found");
+            it->setFlags(Qt::NoItemFlags); cat->addItem(it);
+        }
+        QTimer::singleShot(0, this, [this] { loadVisible(); });
+    }
+    void add(int id) {
+        if (watching(id) || shows.size() >= kMaxShows) return;
+        for (auto& s : Catalog::get().items()) if (s.id == id) { shows.push_back(s); break; }
+        save(); setOpen(false); rebuild(id);
+    }
+    // bouncy grow + fade-in for a freshly added row
+    void popRow(QWidget* r) {
+        auto fx = new QGraphicsOpacityEffect(r); fx->setOpacity(0); r->setGraphicsEffect(fx);
+        r->setFixedHeight(1);
+        auto a = new QVariantAnimation(r); a->setDuration(560); a->setStartValue(0.0); a->setEndValue(1.0); a->setEasingCurve(QEasingCurve::OutBack);
+        connect(a, &QVariantAnimation::valueChanged, r, [this, r, fx](const QVariant& v) {
+            qreal t = v.toReal();
+            fx->setOpacity(qBound(0.0, t * 1.5, 1.0));
+            r->setFixedHeight(qMax(1, int(kRowH * qMax(0.0, t))));
+            syncRows();
+        });
+        connect(a, &QVariantAnimation::finished, r, [this, r] { r->setGraphicsEffect(nullptr); r->setFixedHeight(kRowH); syncRows(); });
+        a->start(QAbstractAnimation::DeleteWhenStopped);
+    }
+    void rebuild(int popId = 0) {
+        while (auto it = rows->takeAt(0)) { if (it->widget()) { it->widget()->hide(); it->widget()->deleteLater(); } delete it; }
+        QWidget* popped = nullptr;
+        for (int i = 0; i < shows.size(); ++i) {
+            auto& s = shows[i];
+            auto r = new QWidget; r->setObjectName("row"); r->setAttribute(Qt::WA_StyledBackground); r->setFixedHeight(kRowH);
+            auto h = new QHBoxLayout(r); h->setContentsMargins(8, 8, 10, 8); h->setSpacing(10);
+            auto cv = new QLabel; cv->setObjectName(QString("cv%1").arg(s.id)); cv->setFixedSize(40, 40); cv->setPixmap(coverFor(s));
+            auto tv = new QVBoxLayout; tv->setSpacing(2);
+            auto t = new ElideLabel(s.t); t->setObjectName("t");
+            auto e = new ElideLabel(QString("episode %1/%2%3").arg(s.ep).arg(s.total ? QString::number(s.total) : "?")
+                                        .arg(s.total && s.ep >= s.total ? "  \u2713" : "")); e->setObjectName("e");
+            tv->addWidget(t); tv->addWidget(e);
+            auto m = new QToolButton; m->setText("\u2212"); m->setObjectName("minus");
+            auto pl = new QToolButton; pl->setText("+"); pl->setObjectName("plus");
+            h->addWidget(cv); h->addLayout(tv, 1); h->addWidget(m); h->addWidget(pl);
+            connect(m, &QToolButton::clicked, this, [this, i] { shows[i].ep = qMax(0, shows[i].ep - 1); save(); rebuild(); });
+            connect(pl, &QToolButton::clicked, this, [this, i] {
+                auto& s = shows[i]; s.ep = s.total ? qMin(s.total, s.ep + 1) : s.ep + 1; save(); rebuild();
+            });
+            r->setContextMenuPolicy(Qt::CustomContextMenu);
+            connect(r, &QWidget::customContextMenuRequested, this, [this, i] {
+                QMenu mm;
+                if (!shows[i].url.isEmpty()) mm.addAction("open on crunchyroll", [this, i] { QDesktopServices::openUrl(QUrl(shows[i].url)); });
+                mm.addAction("remove", [this, i] { shows.removeAt(i); save(); rebuild(); if (box->open) fillCatalog(); });
+                mm.exec(QCursor::pos());
+            });
+            rows->addWidget(r);
+            if (popId && s.id == popId) popped = r;
+        }
+        rows->addStretch(1);
+        box->setVisible(shows.size() < kMaxShows);          // full list -> the dashed box is gone until you remove one
+        if (shows.size() >= kMaxShows && box->open) setOpen(false);
+        syncRows();
+        if (popped) popRow(popped);
+    }
+    QString css() override {
+        return "QScrollArea{background:transparent;border:none;} #host{background:transparent;}"
+               "#row{background:rgba(255,255,255,22);border-radius:12px;} #t{font-weight:600;} #e{font-size:11px;color:#bfe;}"
+               "QToolButton{border-radius:11px;min-width:22px;max-width:22px;min-height:22px;max-height:22px;font-weight:700;}"
+               "#plus{background:ACC2;color:#0b2b25;border:none;} #minus{border:1px solid #ff7b8f;color:#ff7b8f;background:transparent;}"
+               "#close{border:none;color:ACC2;font-size:16px;background:transparent;}"
+               "QLineEdit{background:#f4f4ee;color:#222;border-radius:10px;padding:4px 8px;}"
+               "QListWidget{background:transparent;outline:0;font-size:12px;font-weight:600;}"
+               "QListWidget::item{padding:4px 6px;border-radius:10px;}"
+               "QListWidget::item:hover{background:rgba(255,255,255,30);}"
+               "QListWidget::item:selected{background:ACC;color:#1a1a1a;}";
+    }
+};
+
+// ---------------------------------------------------------------- settings dialog
+void openSettings() {
+    static QPointer<QDialog> dlg;
+    if (dlg) { dlg->raise(); dlg->activateWindow(); return; }
+    auto d = new QDialog; d->setAttribute(Qt::WA_DeleteOnClose); dlg = d; d->setWindowTitle("BetterWidgets settings");
+    auto& c = cfg(); auto tabs = new QTabWidget;
+
+    auto colorBtn = [d](std::shared_ptr<QColor> col) {
+        auto b = new QPushButton; auto paint = [b, col] { b->setStyleSheet("background:" + col->name() + ";min-height:22px;"); }; paint();
+        QObject::connect(b, &QPushButton::clicked, d, [=] { QColor n = QColorDialog::getColor(*col, d); if (n.isValid()) { *col = n; paint(); } });
+        return b;
+    };
+    auto acc = std::make_shared<QColor>(c.accent), acc2 = std::make_shared<QColor>(c.accent2);
+    auto op = new QSlider(Qt::Horizontal); op->setRange(20, 100); op->setValue(c.opacity);
+    auto rad = new QSlider(Qt::Horizontal); rad->setRange(0, 40); rad->setValue(c.radius);
+
+    // font picker + "add font file" button (copies the file into the fonts folder, loads it now, and selects it)
+    auto fc = new QComboBox;
+    auto fillFonts = [fc](const QString& sel) { fc->clear(); fc->addItems(QFontDatabase::families()); fc->setCurrentText(sel); };
+    fillFonts(c.font);
+    auto addFont = new QPushButton("add font file (.ttf / .otf)...");
+    QObject::connect(addFont, &QPushButton::clicked, d, [=] {
+        QStringList files = QFileDialog::getOpenFileNames(d, "choose font files", QDir::homePath(), "fonts (*.ttf *.otf)");
+        QString last;
+        for (auto& f : files) {
+            QString dst = fontsDir() + "/" + QFileInfo(f).fileName();
+            if (f != dst) { QFile::remove(dst); if (!QFile::copy(f, dst)) dst = f; }
+            int id = QFontDatabase::addApplicationFont(dst);
+            if (id >= 0) { auto fam = QFontDatabase::applicationFontFamilies(id); if (!fam.isEmpty()) last = fam.first(); }
+        }
+        if (!last.isEmpty()) fillFonts(last);
+        else if (!files.isEmpty()) QMessageBox::warning(d, "BetterWidgets", "could not load that font file.");
+    });
+
+    auto lock = new QCheckBox("lock widget positions"); lock->setChecked(c.locked);
+    auto snap = new QCheckBox("snap widgets to grid while dragging (hold ALT to ignore)"); snap->setChecked(c.snap);
+    auto gs = new QSpinBox; gs->setRange(5, 200); gs->setSuffix(" px"); gs->setValue(c.grid);
+    auto mono = new QCheckBox("flat one-color app icons"); mono->setChecked(c.mono);
+    auto sz = new QSlider(Qt::Horizontal); sz->setRange(50, 200); sz->setValue(c.size); sz->setToolTip("the app restarts to apply a new size");
+    auto szl = new QLabel(QString::number(c.size) + "%"); szl->setMinimumWidth(42);
+    QObject::connect(sz, &QSlider::valueChanged, szl, [szl](int v) { szl->setText(QString::number(v) + "%"); });
+    auto szRow = new QWidget; auto szh = new QHBoxLayout(szRow); szh->setContentsMargins(0, 0, 0, 0); szh->addWidget(sz, 1); szh->addWidget(szl);
+    auto look = new QWidget; auto f1 = new QFormLayout(look);
+    f1->addRow("widget size (restarts app)", szRow);
+    f1->addRow("accent (highlights)", colorBtn(acc)); f1->addRow("accent 2 (icons, graphs, buttons)", colorBtn(acc2));
+    f1->addRow("opacity (all widgets)", op); f1->addRow("corner radius", rad); f1->addRow("font", fc); f1->addRow(addFont); f1->addRow(mono);
+    f1->addRow(lock); f1->addRow(snap); f1->addRow("grid size", gs);
+    auto openIni = new QPushButton("open settings file (betterwidgets.ini)");
+    QObject::connect(openIni, &QPushButton::clicked, d, [] { QDesktopServices::openUrl(QUrl::fromLocalFile(cfgPath())); });
+    f1->addRow(openIni);
+    tabs->addTab(look, "look");
+
+    auto wid = new QWidget; auto g2 = new QGridLayout(wid); QList<QCheckBox*> cbs; QList<QSpinBox*> sps;
+    g2->addWidget(new QLabel("show"), 0, 0); g2->addWidget(new QLabel("own opacity"), 0, 1);
+    int row = 1;
+    for (auto w : g_widgets) {
+        auto cb = new QCheckBox(w->id); cb->setChecked(w->isVisible()); cbs << cb;
+        auto sp = new QSpinBox; sp->setRange(0, 100); sp->setSuffix("%"); sp->setSpecialValueText("global"); sp->setValue(c.wop.value(w->id, 0)); sps << sp;
+        g2->addWidget(cb, row, 0); g2->addWidget(sp, row, 1); ++row;
+    }
+    g2->setRowStretch(row, 1); tabs->addTab(wid, "widgets");
+
+    auto user = new QLineEdit(c.user); auto ref = new QSpinBox; ref->setRange(5, 600); ref->setSuffix(" min"); ref->setValue(c.refresh);
+    auto h24 = new QCheckBox("24-hour clock"); h24->setChecked(c.h24); auto secs = new QCheckBox("show seconds"); secs->setChecked(c.secs);
+    auto misc = new QWidget; auto f2 = new QFormLayout(misc);
+    f2->addRow("github username", user); f2->addRow("refresh every", ref); f2->addRow(h24); f2->addRow(secs);
+    tabs->addTab(misc, "github & clock");
+
+    auto bb = new QDialogButtonBox(QDialogButtonBox::Apply | QDialogButtonBox::Close);
+    auto v = new QVBoxLayout(d); v->addWidget(tabs); v->addWidget(bb);
+    QObject::connect(bb, &QDialogButtonBox::rejected, d, &QDialog::close);
+    QObject::connect(bb->button(QDialogButtonBox::Apply), &QPushButton::clicked, d, [=] {
+        auto& c = cfg();
+        c.size = sz->value();
+        c.accent = *acc; c.accent2 = *acc2; c.opacity = op->value(); c.radius = rad->value(); c.font = fc->currentText();
+        c.locked = lock->isChecked(); c.mono = mono->isChecked(); c.snap = snap->isChecked(); c.grid = gs->value();
+        c.user = user->text().trimmed(); c.refresh = ref->value(); c.h24 = h24->isChecked(); c.secs = secs->isChecked();
+        for (int i = 0; i < g_widgets.size(); ++i) {
+            g_widgets[i]->setVisible(cbs[i]->isChecked()); QSettings().setValue("visible/" + g_widgets[i]->id, cbs[i]->isChecked());
+            if (sps[i]->value() > 0) c.wop[g_widgets[i]->id] = sps[i]->value(); else c.wop.remove(g_widgets[i]->id);
+        }
+        saveCfg(); emit bus().changed();
+        if (c.size != g_runSize) restartApp();      // a new size needs a fresh start
+    });
+    d->resize(440, 460); d->show();
+}
+
+// ---------------------------------------------------------------- main
+int main(int argc, char** argv) {
+    g_argv0 = argc > 0 ? argv[0] : "";
+    QCoreApplication::setOrganizationName("BetterWidgets"); QCoreApplication::setApplicationName("BetterWidgets");
+    migrateOldIni();
+    g_runSize = earlySize();
+    // widget size: 1.05 is the 100% look (about 60% of a 1080p screen) and the "size" setting scales it.
+    // it has to be set before QApplication exists. (set QT_SCALE_FACTOR yourself to override the size setting)
+    if (qEnvironmentVariableIsEmpty("QT_SCALE_FACTOR")) {
+        qputenv("QT_SCALE_FACTOR", QByteArray::number(1.05 * g_runSize / 100.0, 'f', 3)); g_ownScale = true;
+    }
+    QApplication a(argc, argv);
+    a.setQuitOnLastWindowClosed(false);
+    QLocale::setDefault(QLocale(QLocale::English, QLocale::UnitedStates));      // everything english, whatever the system language is
+    migrateOldSettings();
+    loadFonts(); initCfg();
+
+    // new default layout: clear saved positions once so the reference layout applies (drag widgets afterwards as you like)
+    if (QSettings().value("layoutVer", 1).toInt() < kLayoutVersion) {
+        for (auto& id : kIds) QSettings().remove("pos/" + id);
+        QSettings().setValue("layoutVer", kLayoutVersion);
+    }
+
+    new Launcher; new Clock; new SysInfo; new Github; new Watching;
+    for (auto w : g_widgets) if (QSettings().value("visible/" + w->id, true).toBool()) w->show();
+
+    // hot-reload betterwidgets.ini whenever it is saved
+    QFileSystemWatcher cw; QTimer cwT; cwT.setSingleShot(true); cwT.setInterval(250);
+    auto watchCfg = [&] { if (!cw.files().contains(cfgPath())) cw.addPath(cfgPath()); };
+    watchCfg();
+    QObject::connect(&cw, &QFileSystemWatcher::fileChanged, &cwT, [&] { cwT.start(); });
+    QObject::connect(&cwT, &QTimer::timeout, &cw, [&] {
+        watchCfg(); QString before = cfgText(); loadCfgFile();
+        if (cfgText() != before) emit bus().changed();
+        if (cfg().size != g_runSize) restartApp();
+    });
+
+    QPixmap px(32, 32); px.fill(Qt::transparent);
+    { QPainter p(&px); p.setRenderHint(QPainter::Antialiasing); p.setBrush(cfg().accent); p.setPen(Qt::NoPen); p.drawRoundedRect(4, 4, 24, 24, 8, 8); }
+    QSystemTrayIcon tray{QIcon(px)}; QMenu menu;
+    tray.setToolTip("BetterWidgets");
+    menu.addAction("settings...", [] { openSettings(); });
+    menu.addAction("open settings file", [] { QDesktopServices::openUrl(QUrl::fromLocalFile(cfgPath())); });
+    menu.addAction("reset layout", [] { for (auto w : g_widgets) w->resetPos(); });
+    menu.addAction("show all", [] { for (auto w : g_widgets) { w->show(); QSettings().setValue("visible/" + w->id, true); } });
+    menu.addAction("hide all", [] { for (auto w : g_widgets) { w->hide(); QSettings().setValue("visible/" + w->id, false); } });
+    menu.addSeparator(); menu.addAction("quit", &a, &QApplication::quit);
+    tray.setContextMenu(&menu); tray.show();
+    return a.exec();
+}
+#include "main.moc"
